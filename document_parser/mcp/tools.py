@@ -15,13 +15,28 @@ def get_tool_definitions() -> list[types.Tool]:
     return [
         types.Tool(
             name="parse_document",
-            description="Parse and convert any document (PDF, DOCX, images, audio, etc.) to Markdown format",
+            description=(
+                "Parse a document and extract its content as Markdown. Accepts three "
+                "input modes: (1) source: local file path, (2) url: HTTP/HTTPS URL to "
+                "download, (3) content: base64-encoded file content with filename. "
+                "For files uploaded by users or files not on the parser's local "
+                "filesystem, use the content parameter with base64-encoded bytes and "
+                "provide the filename."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "File path or URL to the document",
+                        "description": "Local file path on the parser's filesystem. Only works if the file exists locally on the parser service.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Base64-encoded file content. Use this when the file is not on the parser's local filesystem (e.g., files uploaded by users to agents). Mutually exclusive with source.",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Original filename with extension (e.g., 'document.docx'). Required when using content parameter.",
                     },
                     "pipeline": {
                         "type": "string",
@@ -57,7 +72,43 @@ def get_tool_definitions() -> list[types.Tool]:
                         },
                     },
                 },
-                "required": ["source"],
+                "oneOf": [
+                    {"required": ["source"]},
+                    {"required": ["content", "filename"]},
+                ],
+            },
+        ),
+        types.Tool(
+            name="parse_document_from_url",
+            description=(
+                "Download a document from an HTTP/HTTPS URL (R2 presigned, public "
+                "link, etc.) and parse it to Markdown. Use this when the file is "
+                "available at a URL the parser can reach but is not on the parser's "
+                "local filesystem. For base64-encoded content from user uploads, "
+                "use parse_document with the content parameter instead."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "HTTP/HTTPS URL pointing to the document (presigned R2 URL, public link, etc.). The parser downloads the file then parses it.",
+                    },
+                    "filename_hint": {
+                        "type": "string",
+                        "description": "Optional filename with extension to preserve format detection when the URL has no obvious filename (e.g., 'report.docx').",
+                    },
+                    "pipeline": {
+                        "type": "string",
+                        "enum": ["standard", "vlm", "asr", "auto"],
+                        "description": "Processing pipeline (optional, auto-detected if not specified)",
+                    },
+                    "options": {
+                        "type": "object",
+                        "description": "Additional processing options (same as parse_document.options)",
+                    },
+                },
+                "required": ["url"],
             },
         ),
         types.Tool(

@@ -2,10 +2,15 @@
 MCP tool handlers.
 """
 
+import base64
+import binascii
 import json
 import logging
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
+import httpx
 import mcp.types as types
 
 from document_parser.config.models import ApplicationSettings
@@ -14,6 +19,11 @@ from document_parser.engine.processor import DocumentProcessor
 from document_parser.processing.job import Job, ProcessingPipeline
 from document_parser.processing.task_queue import TaskQueue
 from document_parser.processing.task_tracker import TaskTracker
+from document_parser.utils.file_utils import ensure_directory, sanitize_filename
+from document_parser.utils.network_utils import (
+    extract_filename_from_url,
+    validate_url_scheme,
+)
 from document_parser.utils.system_utils import generate_unique_id
 
 
@@ -50,6 +60,11 @@ class ToolHandlers:
         """
         Handle basic document parsing request.
 
+        Accepts either `source` (local path / reachable URL) or `content`
+        (base64-encoded bytes) + `filename`. The two modes are mutually
+        exclusive — content mode writes to a temp file, parses it, and
+        cleans up regardless of outcome.
+
         Args:
             arguments: Tool arguments
 
@@ -57,11 +72,53 @@ class ToolHandlers:
             List of TextContent with result
         """
         source = arguments.get("source")
-        if not source:
-            raise ValueError("Missing required parameter: source")
+        content_b64 = arguments.get("content")
+        filename = arguments.get("filename")
+
+        if source and content_b64:
+            raise ValueError(
+                "Parameters `source` and `content` are mutually exclusive — provide one"
+            )
+        if not source and not content_b64:
+            raise ValueError("Missing required parameter: provide `source` or `content`")
+        if content_b64 and not filename:
+            raise ValueError("Parameter `filename` is required when `content` is provided")
 
         pipeline = arguments.get("pipeline", "auto")
         options = arguments.get("options", {})
+
+        temp_path: Path | None = None
+        if content_b64:
+            try:
+                file_bytes = base64.b64decode(content_b64, validate=True)
+            except (binascii.Error, ValueError) as e:
+                raise ValueError(f"Invalid base64 content: {e}")
+
+            max_bytes = self.settings.storage.max_file_size_mb * 1024 * 1024
+            if len(file_bytes) > max_bytes:
+                raise ProcessingError(
+                    f"Decoded content exceeds max_file_size_mb "
+                    f"({self.settings.storage.max_file_size_mb} MB)"
+                )
+
+            safe_name = sanitize_filename(filename) or "document"
+            if not Path(safe_name).suffix:
+                safe_name += ".bin"
+
+            temp_dir = ensure_directory(self.settings.storage.temp_directory)
+            unique_id = generate_unique_id("inline")
+            temp_path = temp_dir / f"{unique_id}_{safe_name}"
+
+            try:
+                with open(temp_path, "wb") as fh:
+                    fh.write(file_bytes)
+            except OSError as e:
+                raise ProcessingError(f"Failed to write inline content to disk: {e}")
+
+            source = str(temp_path)
+            self._logger.info(
+                f"Wrote {len(file_bytes)} inline bytes to {temp_path}"
+            )
 
         self._logger.info(f"Parsing document: {source}")
 
@@ -114,6 +171,101 @@ class ToolHandlers:
         except Exception as e:
             self._logger.error(f"Error parsing document: {e}")
             raise ProcessingError(f"Document parsing failed: {str(e)}")
+
+        finally:
+            if temp_path is not None:
+                try:
+                    if temp_path.exists():
+                        temp_path.unlink()
+                except Exception as cleanup_err:
+                    self._logger.warning(
+                        f"Failed to remove inline temp file {temp_path}: {cleanup_err}"
+                    )
+
+    async def handle_parse_document_from_url(
+        self, arguments: dict[str, Any]
+    ) -> list[types.TextContent]:
+        """
+        Download a document from a URL into a temp file then parse it.
+
+        Used by remote clients (e.g., agents on a different host) that cannot
+        share a local filesystem path with the MCP server.
+        """
+        url = arguments.get("url")
+        if not url:
+            raise ValueError("Missing required parameter: url")
+
+        allowed_schemes = self.settings.storage.allowed_schemes
+        if not validate_url_scheme(url, allowed_schemes):
+            raise ValueError(
+                f"URL scheme not allowed. Allowed schemes: {allowed_schemes}"
+            )
+
+        pipeline = arguments.get("pipeline", "auto")
+        options = arguments.get("options", {})
+        filename_hint = arguments.get("filename_hint")
+
+        # Resolve a safe local filename
+        url_filename = extract_filename_from_url(url)
+        chosen = filename_hint or url_filename or "document"
+        # Drop any query string artefacts that may have leaked into the path
+        chosen = chosen.split("?", 1)[0]
+        safe_name = sanitize_filename(chosen) or "document"
+
+        # If no extension at all, default to .bin so docling can sniff it
+        if not Path(safe_name).suffix:
+            safe_name += ".bin"
+
+        temp_dir = ensure_directory(self.settings.storage.temp_directory)
+        unique_id = generate_unique_id("dl")
+        temp_path = temp_dir / f"{unique_id}_{safe_name}"
+
+        timeout = self.settings.storage.download_timeout_seconds
+        max_bytes = self.settings.storage.max_file_size_mb * 1024 * 1024
+
+        self._logger.info(f"Downloading {url} -> {temp_path}")
+
+        try:
+            downloaded = 0
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout, connect=30.0),
+                follow_redirects=True,
+            ) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    with open(temp_path, "wb") as fh:
+                        async for chunk in response.aiter_bytes(chunk_size=65536):
+                            downloaded += len(chunk)
+                            if downloaded > max_bytes:
+                                raise ProcessingError(
+                                    f"Download exceeds max_file_size_mb "
+                                    f"({self.settings.storage.max_file_size_mb} MB)"
+                                )
+                            fh.write(chunk)
+
+            self._logger.info(
+                f"Downloaded {downloaded} bytes for {urlparse(url).netloc}"
+            )
+
+            return await self.handle_parse_document(
+                {
+                    "source": str(temp_path),
+                    "pipeline": pipeline,
+                    "options": options,
+                }
+            )
+
+        except httpx.HTTPError as e:
+            raise ProcessingError(f"Failed to download {url}: {e}")
+
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception as cleanup_err:
+                self._logger.warning(
+                    f"Failed to remove temp file {temp_path}: {cleanup_err}"
+                )
 
     async def handle_parse_document_advanced(
         self, arguments: dict[str, Any]

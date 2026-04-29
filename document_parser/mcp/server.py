@@ -8,7 +8,7 @@ from typing import Any
 
 import mcp.server.stdio
 import mcp.types as types
-from mcp.server import NotificationOptions, Server
+from mcp.server import Server
 
 from document_parser.config.models import ApplicationSettings
 from document_parser.engine.processor import DocumentProcessor
@@ -66,6 +66,10 @@ class DocumentParserServer:
             try:
                 if name == "parse_document":
                     return await self.handlers.handle_parse_document(arguments)
+                elif name == "parse_document_from_url":
+                    return await self.handlers.handle_parse_document_from_url(
+                        arguments
+                    )
                 elif name == "parse_document_advanced":
                     return await self.handlers.handle_parse_document_advanced(arguments)
                 elif name == "get_job_status":
@@ -118,4 +122,5 @@ class DocumentParserServer:
             read_stream,
             write_stream,
         ):
-            await self.server.run(read_stream, write_stream, NotificationOptions())
+            init_options = self.server.create_initialization_options()
+            await self.server.run(read_stream, write_stream, init_options)
